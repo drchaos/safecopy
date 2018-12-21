@@ -1,10 +1,11 @@
 {-# LANGUAGE GADTs, TypeFamilies, FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns        #-}
+{-# LANGUAGE TypeOperators       #-}
+{-# LANGUAGE PolyKinds           #-}
+{-# LANGUAGE DefaultSignatures   #-}
 
 {-# LANGUAGE CPP #-}
-#ifdef DEFAULT_SIGNATURES
-{-# LANGUAGE DefaultSignatures #-}
-#endif
 
 -----------------------------------------------------------------------------
 -- |
@@ -21,11 +22,16 @@
 --
 module Data.SafeCopy.SafeCopy where
 
-import Data.Serialize
+import Codec.Serialise
+import Codec.Serialise.Decoding
+import Codec.Serialise.Encoding
 
 import Control.Monad
 import Data.Int (Int32)
 import Data.List
+import Data.Monoid ((<>))
+
+import GHC.Generics
 
 -- | The central mechanism for dealing with version control.
 --
@@ -95,12 +101,18 @@ class SafeCopy a where
     -- | This method defines how a value should be parsed without also worrying
     --   about writing out the version tag. This function cannot be used directly.
     --   One should use 'safeGet', instead.
-    getCopy  :: Contained (Get a)
+    getCopy  :: Contained (Decoder s a)
+    default getCopy :: (Generic a, GSerialiseDecode (Rep a)) => Contained (Decoder s a)
+    getCopy = contain (to <$> gdecode)
+
 
     -- | This method defines how a value should be parsed without worrying about
     --   previous versions or migrations. This function cannot be used directly.
     --   One should use 'safeGet', instead.
-    putCopy  :: a -> Contained Put
+    putCopy  :: a -> Contained Encoding
+    --encode  :: a -> Encoding
+    default putCopy :: (Generic a, GSerialiseEncode (Rep a)) => a -> Contained Encoding
+    putCopy = contain . gencode . from
 
     -- | Internal function that should not be overrided.
     --   @Consistent@ iff the version history is consistent
@@ -124,21 +136,12 @@ class SafeCopy a where
     errorTypeName :: Proxy a -> String
     errorTypeName _ = "<unknown type>"
 
-#ifdef DEFAULT_SIGNATURES
-    default getCopy :: Serialize a => Contained (Get a)
-    getCopy = contain get
 
-    default putCopy :: Serialize a => a -> Contained Put
-    putCopy = contain . put
-#endif
-
-
--- constructGetterFromVersion :: SafeCopy a => Version a -> Kind (MigrateFrom (Reverse a)) -> Get (Get a)
-constructGetterFromVersion :: SafeCopy a => Version a -> Kind a -> Either String (Get a)
+constructGetterFromVersion :: SafeCopy a => Version a -> Kind a -> Either String (Decoder s a)
 constructGetterFromVersion diskVersion orig_kind =
   worker False diskVersion orig_kind
   where
-    worker :: forall a. SafeCopy a => Bool -> Version a -> Kind a -> Either String (Get a)
+    worker :: forall s a. SafeCopy a => Bool -> Version a -> Kind a -> Either String (Decoder s a)
     worker fwd thisVersion thisKind
       | version == thisVersion = return $ unsafeUnPack getCopy
       | otherwise =
@@ -152,9 +155,9 @@ constructGetterFromVersion diskVersion orig_kind =
           Extended a_kind -> do
             let rev_proxy :: Proxy (MigrateFrom (Reverse a))
                 rev_proxy = Proxy
-                forwardGetter :: Either String (Get a)
+                forwardGetter :: Either String (Decoder s a)
                 forwardGetter  = fmap (fmap (unReverse . migrate)) $ worker True (castVersion thisVersion) (kindFromProxy rev_proxy)
-                previousGetter :: Either String (Get a)
+                previousGetter :: Either String (Decoder s a)
                 previousGetter = worker fwd (castVersion thisVersion) a_kind
             case forwardGetter of
               Left{}    -> previousGetter
@@ -175,19 +178,20 @@ constructGetterFromVersion diskVersion orig_kind =
 
 -- | Parse a version tagged data type and then migrate it to the desired type.
 --   Any serialized value has been extended by the return type can be parsed.
-safeGet :: SafeCopy a => Get a
+safeGet :: SafeCopy a => Decoder s a
 safeGet
     = join getSafeGet
 
 -- | Parse a version tag and return the corresponding migrated parser. This is
 --   useful when you can prove that multiple values have the same version.
 --   See 'getSafePut'.
-getSafeGet :: forall a. SafeCopy a => Get (Get a)
+getSafeGet :: forall a s. SafeCopy a => Decoder s (Decoder s a)
 getSafeGet
     = checkConsistency proxy $
       case kindFromProxy proxy of
         Primitive -> return $ unsafeUnPack getCopy
-        a_kind    -> do v <- get
+        a_kind    -> do decodeListLenOf 2
+                        v <- decode
                         case constructGetterFromVersion v a_kind of
                           Right getter -> return getter
                           Left msg     -> fail msg
@@ -196,21 +200,23 @@ getSafeGet
 -- | Serialize a data type by first writing out its version tag. This is much
 --   simpler than the corresponding 'safeGet' since previous versions don't
 --   come into play.
-safePut :: SafeCopy a => a -> Put
+safePut :: SafeCopy a => a -> Encoding
 safePut a
-    = do putter <- getSafePut
-         putter a
+  = let (versionHeader, putter) = getSafePut
+    in versionHeader <> putter a
 
 -- | Serialize the version tag and return the associated putter. This is useful
 --   when serializing multiple values with the same version. See 'getSafeGet'.
-getSafePut :: forall a. SafeCopy a => PutM (a -> Put)
+getSafePut :: forall a. (SafeCopy a) => (Encoding, a -> Encoding)
 getSafePut
-    = checkConsistency proxy $
-      case kindFromProxy proxy of
-        Primitive -> return $ \a -> unsafeUnPack (putCopy $ asProxyType a proxy)
-        _         -> do put (versionFromProxy proxy)
-                        return $ \a -> unsafeUnPack (putCopy $ asProxyType a proxy)
-    where proxy = Proxy :: Proxy a
+    = case consistentFromProxy proxy of
+        NotConsistent msg -> error msg -- HACK!!!
+        Consistent        ->
+          case kindFromProxy proxy of
+            Primitive -> (mempty, putter)
+            _         -> (encodeListLen 2 <> encode (versionFromProxy proxy), putter)
+    where proxy    = Proxy :: Proxy a
+          putter a = unsafeUnPack (putCopy $ asProxyType a proxy)
 
 -- | The extended_extension kind lets the system know that there is
 --   at least one previous and one future version of this type.
@@ -259,9 +265,9 @@ instance Num (Version a) where
     signum (Version a) = Version (signum a)
     fromInteger i = Version (fromInteger i)
 
-instance Serialize (Version a) where
-    get = liftM Version get
-    put = put . unVersion
+instance Serialise (Version a) where
+  encode = encodeInt32 . unVersion
+  decode = Version <$> decodeInt32
 
 -------------------------------------------------
 -- Container type to control the access to the
@@ -395,3 +401,188 @@ mkProxy _ = Proxy
 
 asProxyType :: a -> Proxy a -> a
 asProxyType a _ = a
+
+--------------------------------------------------------------------------------
+-- Generic instances
+
+-- Factored into two classes because this makes GHC optimize the
+-- instances faster. This doesn't matter for builds of binary, but it
+-- matters a lot for end-users who write 'instance Binary T'. See
+-- also: https://ghc.haskell.org/trac/ghc/ticket/9630
+
+class GSerialiseEncode f where
+    gencode  :: f a -> Encoding
+
+class GSerialiseDecode f where
+    gdecode  :: Decoder s (f a)
+
+instance GSerialiseEncode V1 where
+    -- Data types without constructors are still serialised as null value
+    gencode _ = encodeNull
+
+instance GSerialiseDecode V1 where
+    gdecode   = error "V1 don't have contructors" <$ decodeNull
+
+instance GSerialiseEncode U1 where
+    -- Constructors without fields are serialised as null value
+    gencode _ = encodeListLen 1 <> encodeWord 0
+
+instance GSerialiseDecode U1 where
+    gdecode   = do
+      n <- decodeListLen
+      when (n /= 1) $ fail "expect list of length 1"
+      tag <- decodeWord
+      when (tag /= 0) $ fail "unexpected tag. Expect 0"
+      return U1
+
+instance GSerialiseEncode a => GSerialiseEncode (M1 i c a) where
+    -- Metadata (constructor name, etc) is skipped
+    gencode = gencode . unM1
+
+instance GSerialiseDecode a => GSerialiseDecode (M1 i c a) where
+    gdecode = M1 <$> gdecode
+
+instance SafeCopy a => GSerialiseEncode (K1 i a) where
+    -- Constructor field (Could only appear in one-field & one-constructor
+    -- data types). In all other cases we go through GSerialise{Sum,Prod}
+    gencode (K1 a) = encodeListLen 2
+                  <> encodeWord 0
+                  <> safePut a
+
+instance SafeCopy a => GSerialiseDecode (K1 i a) where
+    gdecode = do
+      n <- decodeListLen
+      when (n /= 2) $
+        fail "expect list of length 2"
+      tag <- decodeWord
+      when (tag /= 0) $
+        fail "unexpected tag. Expects 0"
+      K1 <$> safeGet
+
+instance (GSerialiseProd f, GSerialiseProd g) => GSerialiseEncode (f :*: g) where
+    -- Products are serialised as N-tuples with 0 constructor tag
+    gencode (f :*: g)
+        = encodeListLen (nFields (Proxy :: Proxy (f :*: g)) + 1)
+       <> encodeWord 0
+       <> encodeSeq f
+       <> encodeSeq g
+
+instance (GSerialiseProd f, GSerialiseProd g) => GSerialiseDecode (f :*: g) where
+    gdecode = do
+      let nF = nFields (Proxy :: Proxy (f :*: g))
+      n <- decodeListLen
+      -- TODO FIXME: signedness of list length
+      when (fromIntegral n /= nF + 1) $
+        fail $ "Wrong number of fields: expected="++show (nF+1)++" got="++show n
+      tag <- decodeWord
+      when (tag /= 0) $
+        fail $ "unexpect tag (expect 0)"
+      !f <- gdecodeSeq
+      !g <- gdecodeSeq
+      return $ f :*: g
+
+instance (GSerialiseSum f, GSerialiseSum g) => GSerialiseEncode (f :+: g) where
+    -- Sum types are serialised as N-tuples and first element is
+    -- constructor tag
+    gencode a = encodeListLen (numOfFields a + 1)
+             <> encode (conNumber a)
+             <> encodeSum a
+
+instance (GSerialiseSum f, GSerialiseSum g) => GSerialiseDecode (f :+: g) where
+    gdecode = do
+        n <- decodeListLen
+        -- TODO FIXME: Again signedness
+        when (n == 0) $
+          fail "Empty list encountered for sum type"
+        nCon  <- decodeWord
+        trueN <- fieldsForCon (Proxy :: Proxy (f :+: g)) nCon
+        when (n-1 /= fromIntegral trueN ) $
+          fail $ "Number of fields mismatch: expected="++show trueN++" got="++show n
+        decodeSum nCon
+
+
+-- | Serialization of product types
+class GSerialiseProd f where
+    -- | Number of fields in product type
+    nFields   :: Proxy f -> Word
+    -- | Encode fields sequentially without writing header
+    encodeSeq :: f a -> Encoding
+    -- | Decode fields sequentially without reading header
+    gdecodeSeq :: Decoder s (f a)
+
+instance (GSerialiseProd f, GSerialiseProd g) => GSerialiseProd (f :*: g) where
+    nFields _ = nFields (Proxy :: Proxy f) + nFields (Proxy :: Proxy g)
+    encodeSeq (f :*: g) = encodeSeq f <> encodeSeq g
+    gdecodeSeq = do !f <- gdecodeSeq
+                    !g <- gdecodeSeq
+                    return (f :*: g)
+
+instance GSerialiseProd U1 where
+    -- N.B. Could only be reached when one of constructors in sum type
+    --      don't have parameters
+    nFields   _ = 0
+    encodeSeq _ = mempty
+    gdecodeSeq  = return U1
+
+instance (SafeCopy a) => GSerialiseProd (K1 i a) where
+    -- Ordinary field
+    nFields    _     = 1
+    encodeSeq (K1 f) = safePut f
+    gdecodeSeq       = K1 <$> safeGet
+
+instance (i ~ S, GSerialiseProd f) => GSerialiseProd (M1 i c f) where
+    -- We skip metadata
+    nFields     _     = 1
+    encodeSeq  (M1 f) = encodeSeq f
+    gdecodeSeq        = M1 <$> gdecodeSeq
+
+-- | Serialization of sum types
+class GSerialiseSum f where
+    -- | Number of constructor of given value
+    conNumber   :: f a -> Word
+    -- | Number of fields of given value
+    numOfFields :: f a -> Word
+    -- | Encode field
+    encodeSum   :: f a  -> Encoding
+
+    -- | Decode field
+    decodeSum     :: Word -> Decoder s (f a)
+    -- | Number of constructors
+    nConstructors :: Proxy f -> Word
+    -- | Number of fields for given constructor number
+    fieldsForCon  :: Proxy f -> Word -> Decoder s Word
+
+instance (GSerialiseSum f, GSerialiseSum g) => GSerialiseSum (f :+: g) where
+    conNumber x = case x of
+      L1 f -> conNumber f
+      R1 g -> conNumber g + nConstructors (Proxy :: Proxy f)
+    numOfFields x = case x of
+      L1 f -> numOfFields f
+      R1 g -> numOfFields g
+    encodeSum x = case x of
+      L1 f -> encodeSum f
+      R1 g -> encodeSum g
+
+    nConstructors _ = nConstructors (Proxy :: Proxy f)
+                    + nConstructors (Proxy :: Proxy g)
+
+    fieldsForCon _ n | n < nL    = fieldsForCon (Proxy :: Proxy f) n
+                     | otherwise = fieldsForCon (Proxy :: Proxy g) (n - nL)
+      where
+        nL = nConstructors (Proxy :: Proxy f)
+
+    decodeSum nCon | nCon < nL = L1 <$> decodeSum nCon
+                   | otherwise = R1 <$> decodeSum (nCon - nL)
+      where
+        nL = nConstructors (Proxy :: Proxy f)
+
+instance (i ~ C, GSerialiseProd f) => GSerialiseSum (M1 i c f) where
+    conNumber    _     = 0
+    numOfFields  _     = nFields (Proxy :: Proxy f)
+    encodeSum   (M1 f) = encodeSeq f
+
+    nConstructors  _ = 1
+    fieldsForCon _ 0 = return $ nFields (Proxy :: Proxy f)
+    fieldsForCon _ _ = fail "Bad constructor number"
+    decodeSum      0 = M1 <$> gdecodeSeq
+    decodeSum      _ = fail "bad constructor number"

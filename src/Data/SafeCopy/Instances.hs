@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable, FlexibleContexts, UndecidableInstances, TypeFamilies #-}
+{-# LANGUAGE FlexibleInstances, BangPatterns #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 module Data.SafeCopy.Instances where
 
@@ -9,6 +10,9 @@ import Data.SafeCopy.SafeCopy
 import           Control.Applicative
 #endif
 import           Control.Monad
+import           Codec.Serialise
+import           Codec.Serialise.Decoding
+import           Codec.Serialise.Encoding
 import qualified Data.Array as Array
 import qualified Data.Array.Unboxed as UArray
 import qualified Data.Array.IArray as IArray
@@ -22,14 +26,11 @@ import qualified Data.IntSet as IntSet
 import           Data.Ix
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
-import           Data.Ratio (Ratio, (%), numerator, denominator)
+import           Data.Ratio (Ratio)
 import qualified Data.Sequence as Sequence
-import           Data.Serialize
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
 import qualified Data.Text.Lazy as TL
-import qualified Data.Text.Lazy.Encoding as TL
 import           Data.Time.Calendar (Day(..))
 import           Data.Time.Clock (DiffTime, NominalDiffTime, UniversalTime(..), UTCTime(..))
 import           Data.Time.Clock.TAI (AbsoluteTime, taiEpoch, addAbsoluteTime, diffAbsoluteTime)
@@ -49,6 +50,8 @@ import qualified Data.Vector.Primitive as VP
 import qualified Data.Vector.Storable as VS
 import qualified Data.Vector.Unboxed as VU
 
+import Data.Monoid ((<>))
+
 instance SafeCopy a => SafeCopy (Prim a) where
   kind = primitive
   getCopy = contain $
@@ -57,75 +60,162 @@ instance SafeCopy a => SafeCopy (Prim a) where
   putCopy (Prim e)
     = contain $ unsafeUnPack (putCopy e)
 
-instance SafeCopy a => SafeCopy [a] where
+instance {-# OVERLAPPABLE #-} SafeCopy a => SafeCopy [a] where
+  kind = primitive
   getCopy = contain $ do
-    n <- get
-    g <- getSafeGet
-    go g [] n
-      where
-        go :: Get a -> [a] -> Int -> Get [a]
-        go _ as 0 = return (reverse as)
-        go g as i = do x <- g
-                       x `seq` go g (x:as) (i - 1)
-  putCopy lst = contain $ do put (length lst)
-                             getSafePut >>= forM_ lst
+    getter <- getSafeGet
+    mn <- decodeListLenOrIndef
+    d <- case mn of
+      Nothing -> decodeSequenceLenIndef (flip (:)) [] reverse   getter
+      Just n  -> decodeSequenceLenN     (flip (:)) [] reverse n getter
+    return d
+
+  putCopy lst = contain $ versionHeader <>
+                  if null lst then
+                          encodeListLen 0
+                    else
+                          encodeListLenIndef
+                       <> mconcat (map putter lst)
+                       <> encodeBreak
+    where
+      (versionHeader, putter) = getSafePut
   errorTypeName = typeName1
 
+instance {-# INCOHERENT #-} SafeCopy [Char] where
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
+
 instance SafeCopy a => SafeCopy (NonEmpty.NonEmpty a) where
-    getCopy = contain $ fmap NonEmpty.fromList safeGet
+    getCopy = contain $ do
+      l <- safeGet
+      case NonEmpty.nonEmpty l of
+        Nothing -> fail "Expected a NonEmpty list, but an empty list was found!"
+        Just xs -> return xs
     putCopy = contain . safePut . NonEmpty.toList
     errorTypeName = typeName1
 
 instance SafeCopy a => SafeCopy (Maybe a) where
-    getCopy = contain $ do n <- get
-                           if n then liftM Just safeGet
-                                else return Nothing
-    putCopy (Just a) = contain $ put True >> safePut a
-    putCopy Nothing = contain $ put False
+    getCopy = contain $ do
+                          n <- decodeListLen
+                          case n of
+                            0 -> return Nothing
+                            1 -> do !x <- safeGet
+                                    return (Just x)
+                            _ -> fail "unknown tag"
+    putCopy (Just a) = contain $ encodeListLen 1 <> safePut a
+    putCopy Nothing = contain $ encodeListLen 0
     errorTypeName = typeName1
+
+encodeSetSkel :: SafeCopy a
+              => (s -> Int)
+              -> ((a -> Encoding -> Encoding) -> Encoding -> s -> Encoding)
+              -> s
+              -> Encoding
+encodeSetSkel size foldr' =
+  encodeContainerSkel
+    encodeListLen
+    size
+    foldr'
+    (\a b -> putter a <> b)
+    versionHeader
+  where
+    (versionHeader, putter) = getSafePut
+{-# INLINE encodeSetSkel #-}
+
+decodeSetSkel :: SafeCopy a
+              => ([a] -> c) -> Decoder s c
+decodeSetSkel fromList = do
+  getter <- getSafeGet
+  n <- decodeListLen
+  fmap fromList (replicateM n getter)
+{-# INLINE decodeSetSkel #-}
 
 instance (SafeCopy a, Ord a) => SafeCopy (Set.Set a) where
-    getCopy = contain $ fmap Set.fromDistinctAscList safeGet
-    putCopy = contain . safePut . Set.toAscList
-    errorTypeName = typeName1
-
-instance (SafeCopy a, SafeCopy b, Ord a) => SafeCopy (Map.Map a b) where
-    getCopy = contain $ fmap Map.fromDistinctAscList safeGet
-    putCopy = contain . safePut . Map.toAscList
-    errorTypeName = typeName2
-
-instance (SafeCopy a) => SafeCopy (IntMap.IntMap a) where
-    getCopy = contain $ fmap IntMap.fromDistinctAscList safeGet
-    putCopy = contain . safePut . IntMap.toAscList
+    getCopy = contain $ decodeSetSkel Set.fromList
+    putCopy = contain . encodeSetSkel Set.size Set.foldr
     errorTypeName = typeName1
 
 instance SafeCopy IntSet.IntSet where
-    getCopy = contain $ fmap IntSet.fromDistinctAscList safeGet
-    putCopy = contain . safePut . IntSet.toAscList
+    getCopy = contain $ decodeSetSkel IntSet.fromList
+    putCopy = contain . encodeSetSkel IntSet.size IntSet.foldr
     errorTypeName = typeName
 
+encodeMapSkel :: (SafeCopy k, SafeCopy v)
+              => (m -> Int)
+              -> ((k -> v -> Encoding -> Encoding) -> Encoding -> m -> Encoding)
+              -> m
+              -> Encoding
+encodeMapSkel size foldrWithKey =
+  encodeContainerSkel
+    encodeMapLen
+    size
+    foldrWithKey
+    (\k v b -> keyPutter k <> valPutter v <> b)
+    (keyVersionHeader <> valVersionHeader)
+  where
+    (keyVersionHeader, keyPutter) = getSafePut
+    (valVersionHeader, valPutter) = getSafePut
+{-# INLINE encodeMapSkel #-}
+
+decodeMapSkel :: (SafeCopy k, SafeCopy v)
+              => ([(k,v)] -> m)
+              -> Decoder s m
+decodeMapSkel fromList = do
+  keyGetter <- getSafeGet
+  valGetter <- getSafeGet
+  n <- decodeMapLen
+  let decodeEntry = do
+        !k <- keyGetter
+        !v <- valGetter
+        return (k, v)
+  fmap fromList (replicateM n decodeEntry)
+{-# INLINE decodeMapSkel #-}
+
+instance (SafeCopy a, SafeCopy b, Ord a) => SafeCopy (Map.Map a b) where
+    getCopy = contain $ decodeMapSkel Map.fromList
+    putCopy = contain . encodeMapSkel Map.size Map.foldrWithKey
+    errorTypeName = typeName2
+
+instance (SafeCopy a) => SafeCopy (IntMap.IntMap a) where
+    getCopy = contain $ decodeMapSkel IntMap.fromList
+    putCopy = contain . encodeMapSkel IntMap.size IntMap.foldrWithKey
+    errorTypeName = typeName1
+
 instance (SafeCopy a) => SafeCopy (Sequence.Seq a) where
-    getCopy = contain $ fmap Sequence.fromList safeGet
-    putCopy = contain . safePut . Foldable.toList
+    getCopy = contain $ decodeContainerSkelWithReplicate
+                          decodeListLen
+                          Sequence.replicateM
+                          mconcat
+    putCopy s = contain $ encodeContainerSkel
+                            encodeListLen
+                            Sequence.length
+                            Foldable.foldr
+                            (\a b -> putter a <> b)
+                            versionHeader
+                            s
+      where
+        (versionHeader, putter) = getSafePut
     errorTypeName = typeName1
 
 instance (SafeCopy a) => SafeCopy (Tree.Tree a) where
-    getCopy = contain $ liftM2 Tree.Node safeGet safeGet
-    putCopy (Tree.Node root sub) = contain $ safePut root >> safePut sub
+    getCopy = contain $ decodeListLenOf 2 *> (Tree.Node <$> safeGet <*> safeGet)
+    putCopy (Tree.Node root sub) = contain $ encodeListLen 2 <> safePut root <> safePut sub
     errorTypeName = typeName1
 
-iarray_getCopy :: (Ix i, SafeCopy e, SafeCopy i, IArray.IArray a e) => Contained (Get (a i e))
-iarray_getCopy = contain $ do getIx <- getSafeGet
+iarray_getCopy :: (Ix i, SafeCopy e, SafeCopy i, IArray.IArray a e) => Contained (Decoder s (a i e))
+iarray_getCopy = contain $ do decodeListLenOf 3
+                              getIx <- getSafeGet
                               liftM3 mkArray getIx getIx safeGet
     where
       mkArray l h xs = IArray.listArray (l, h) xs
 {-# INLINE iarray_getCopy #-}
 
-iarray_putCopy :: (Ix i, SafeCopy e, SafeCopy i, IArray.IArray a e) => a i e -> Contained Put
-iarray_putCopy arr = contain $ do putIx <- getSafePut
-                                  let (l,h) = IArray.bounds arr
-                                  putIx l >> putIx h
-                                  safePut (IArray.elems arr)
+iarray_putCopy :: (Ix i, SafeCopy e, SafeCopy i, IArray.IArray a e) => a i e -> Contained Encoding
+iarray_putCopy arr = contain $ let (versionHeader, putIx) = getSafePut
+                                   (l,h) = IArray.bounds arr
+                               in    encodeListLen 3
+                                  <> versionHeader <> putIx l <> putIx h
+                                  <> safePut (IArray.elems arr)
 {-# INLINE iarray_putCopy #-}
 
 instance (Ix i, SafeCopy e, SafeCopy i) => SafeCopy (Array.Array i e) where
@@ -139,143 +229,157 @@ instance (IArray.IArray UArray.UArray e, Ix i, SafeCopy e, SafeCopy i) => SafeCo
     errorTypeName = typeName2
 
 instance (SafeCopy a, SafeCopy b) => SafeCopy (a,b) where
-    getCopy = contain $ liftM2 (,) safeGet safeGet
-    putCopy (a,b) = contain $ safePut a >> safePut b
+    kind = primitive
+    getCopy = contain $ do
+      decodeListLenOf 2
+      liftM2 (,) safeGet safeGet
+    putCopy (a,b) = contain $ encodeListLen 2 <> safePut a <> safePut b
     errorTypeName = typeName2
 instance (SafeCopy a, SafeCopy b, SafeCopy c) => SafeCopy (a,b,c) where
-    getCopy = contain $ liftM3 (,,) safeGet safeGet safeGet
-    putCopy (a,b,c) = contain $ safePut a >> safePut b >> safePut c
+    kind = primitive
+    getCopy = contain $ do
+      decodeListLenOf 3
+      liftM3 (,,) safeGet safeGet safeGet
+    putCopy (a,b,c) = contain $ encodeListLen 3
+                             <> safePut a <> safePut b <> safePut c
 instance (SafeCopy a, SafeCopy b, SafeCopy c, SafeCopy d) => SafeCopy (a,b,c,d) where
-    getCopy = contain $ liftM4 (,,,) safeGet safeGet safeGet safeGet
-    putCopy (a,b,c,d) = contain $ safePut a >> safePut b >> safePut c >> safePut d
+    kind = primitive
+    getCopy = contain $ do
+      decodeListLenOf 4
+      liftM4 (,,,) safeGet safeGet safeGet safeGet
+    putCopy (a,b,c,d) = contain $ encodeListLen 4
+                               <> safePut a <> safePut b <> safePut c <> safePut d
 instance (SafeCopy a, SafeCopy b, SafeCopy c, SafeCopy d, SafeCopy e) =>
          SafeCopy (a,b,c,d,e) where
-    getCopy = contain $ liftM5 (,,,,) safeGet safeGet safeGet safeGet safeGet
-    putCopy (a,b,c,d,e) = contain $ safePut a >> safePut b >> safePut c >> safePut d >> safePut e
+    kind = primitive
+    getCopy = contain $ do
+      decodeListLenOf 5
+      liftM5 (,,,,) safeGet safeGet safeGet safeGet safeGet
+    putCopy (a,b,c,d,e) = contain $ encodeListLen 5
+                                 <> safePut a <> safePut b <> safePut c <> safePut d <> safePut e
 instance (SafeCopy a, SafeCopy b, SafeCopy c, SafeCopy d, SafeCopy e, SafeCopy f) =>
          SafeCopy (a,b,c,d,e,f) where
-    getCopy = contain $ (,,,,,) <$> safeGet <*> safeGet <*> safeGet <*> safeGet <*> safeGet <*> safeGet
-    putCopy (a,b,c,d,e,f) = contain $ safePut a >> safePut b >> safePut c >> safePut d >>
-                                      safePut e >> safePut f
+    kind = primitive
+    getCopy = contain $ do
+      decodeListLenOf 6
+      (,,,,,) <$> safeGet <*> safeGet <*> safeGet <*> safeGet <*> safeGet <*> safeGet
+    putCopy (a,b,c,d,e,f) = contain $ encodeListLen 6
+                                   <> safePut a <> safePut b <> safePut c <> safePut d
+                                   <> safePut e <> safePut f
 instance (SafeCopy a, SafeCopy b, SafeCopy c, SafeCopy d, SafeCopy e, SafeCopy f, SafeCopy g) =>
          SafeCopy (a,b,c,d,e,f,g) where
-    getCopy = contain $ (,,,,,,) <$> safeGet <*> safeGet <*> safeGet <*> safeGet <*>
+    kind = primitive
+    getCopy = contain $ do
+      decodeListLenOf 7
+      (,,,,,,) <$> safeGet <*> safeGet <*> safeGet <*> safeGet <*>
                                      safeGet <*> safeGet <*> safeGet
-    putCopy (a,b,c,d,e,f,g) = contain $ safePut a >> safePut b >> safePut c >> safePut d >>
-                                        safePut e >> safePut f >> safePut g
+    putCopy (a,b,c,d,e,f,g) = contain $ encodeListLen 7
+                                     <> safePut a <> safePut b <> safePut c <> safePut d
+                                     <> safePut e <> safePut f <> safePut g
 
 
 instance SafeCopy Int where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Integer where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
-
--- | cereal change the formats for Float/Double in 0.5.*
---
--- https://github.com/GaloisInc/cereal/commit/47d839609413e3e9d1147b99c34ae421ae36bced
--- https://github.com/GaloisInc/cereal/issues/35
-newtype CerealFloat040 = CerealFloat040 { unCerealFloat040 :: Float} deriving (Show, Typeable)
-instance SafeCopy CerealFloat040 where
-    getCopy = contain (CerealFloat040 <$> liftM2 encodeFloat get get)
-    putCopy (CerealFloat040 float) = contain (put (decodeFloat float))
-    errorTypeName = typeName
-
-instance Migrate Float where
-  type MigrateFrom Float = CerealFloat040
-  migrate (CerealFloat040 d) = d
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 
 instance SafeCopy Float where
-  version = Version 1
-  kind = extension
-  getCopy = contain get
-  putCopy = contain . put
+  kind = primitive
+  getCopy = contain decode
+  putCopy = contain . encode
   errorTypeName = typeName
-
--- | cereal change the formats for Float/Double in 0.5.*
---
--- https://github.com/GaloisInc/cereal/commit/47d839609413e3e9d1147b99c34ae421ae36bced
--- https://github.com/GaloisInc/cereal/issues/35
-newtype CerealDouble040 = CerealDouble040 { unCerealDouble040 :: Double} deriving (Show, Typeable)
-instance SafeCopy CerealDouble040 where
-    getCopy = contain (CerealDouble040 <$> liftM2 encodeFloat get get)
-    putCopy (CerealDouble040 double) = contain (put (decodeFloat double))
-    errorTypeName = typeName
-
-instance Migrate Double where
-  type MigrateFrom Double = CerealDouble040
-  migrate (CerealDouble040 d) = d
 
 instance SafeCopy Double where
-  version = Version 1
-  kind = extension
-  getCopy = contain get
-  putCopy = contain . put
+  kind = primitive
+  getCopy = contain decode
+  putCopy = contain . encode
   errorTypeName = typeName
 
-
 instance SafeCopy L.ByteString where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy B.ByteString where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Char where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Word where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Word8 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Word16 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Word32 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Word64 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Ordering where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Int8 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Int16 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Int32 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Int64 where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
-instance (Integral a, SafeCopy a) => SafeCopy (Ratio a) where
-    getCopy   = contain $ do n <- safeGet
-                             d <- safeGet
-                             return (n % d)
-    putCopy r = contain $ do safePut (numerator   r)
-                             safePut (denominator r)
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
+instance (Integral a, Serialise a) => SafeCopy (Ratio a) where
+    kind = primitive
+    getCopy = contain decode
+    putCopy = contain . encode
     errorTypeName = typeName1
 instance (HasResolution a, Fractional (Fixed a)) => SafeCopy (Fixed a) where
-    getCopy   = contain $ fromRational <$> safeGet
-    putCopy   = contain . safePut . toRational
+    kind = primitive
+    getCopy   = contain decode
+    putCopy   = contain . encode
     errorTypeName = typeName1
 
 instance SafeCopy () where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance SafeCopy Bool where
-    getCopy = contain get; putCopy = contain . put; errorTypeName = typeName
+    kind = primitive
+    getCopy = contain decode; putCopy = contain . encode; errorTypeName = typeName
 instance (SafeCopy a, SafeCopy b) => SafeCopy (Either a b) where
-    getCopy = contain $ do n <- get
-                           if n then liftM Right safeGet
-                                else liftM Left safeGet
-    putCopy (Right a) = contain $ put True >> safePut a
-    putCopy (Left a) = contain $ put False >> safePut a
+    getCopy = contain $ do decodeListLenOf 2
+                           t <- decodeWord
+                           case t of
+                             0 -> do !x <- safeGet
+                                     return (Left x)
+                             1 -> do !x <- safeGet
+                                     return (Right x)
+                             _ -> fail "unknown tag"
+
+    putCopy (Left  a) = contain $ encodeListLen 2 <> encodeWord 0 <> safePut a
+    putCopy (Right a) = contain $ encodeListLen 2 <> encodeWord 1 <> safePut a
 
     errorTypeName = typeName2
 
 --  instances for 'text' library
 
 instance SafeCopy T.Text where
-    kind = base
-    getCopy = contain $ T.decodeUtf8 <$> safeGet
-    putCopy = contain . safePut . T.encodeUtf8
+    kind = primitive
+    getCopy = contain decode
+    putCopy = contain . encode
     errorTypeName = typeName
 
 instance SafeCopy TL.Text where
-    kind = base
-    getCopy = contain $ TL.decodeUtf8 <$> safeGet
-    putCopy = contain . safePut . TL.encodeUtf8
+    kind = primitive
+    getCopy = contain decode
+    putCopy = contain . encode
     errorTypeName = typeName
 
 -- instances for 'time' library
@@ -300,11 +404,8 @@ instance SafeCopy UniversalTime where
 
 instance SafeCopy UTCTime where
     kind = base
-    getCopy   = contain $ do day      <- safeGet
-                             diffTime <- safeGet
-                             return (UTCTime day diffTime)
-    putCopy u = contain $ do safePut (utctDay u)
-                             safePut (utctDayTime u)
+    getCopy = contain decode
+    putCopy = contain . encode
     errorTypeName = typeName
 
 instance SafeCopy NominalDiffTime where
@@ -319,9 +420,9 @@ instance SafeCopy TimeOfDay where
                              mins <- safeGet
                              sec  <- safeGet
                              return (TimeOfDay hour mins sec)
-    putCopy t = contain $ do safePut (todHour t)
-                             safePut (todMin t)
-                             safePut (todSec t)
+    putCopy t = contain $    safePut (todHour t)
+                          <> safePut (todMin t)
+                          <> safePut (todSec t)
     errorTypeName = typeName
 
 instance SafeCopy TimeZone where
@@ -330,9 +431,9 @@ instance SafeCopy TimeZone where
                              summerOnly <- safeGet
                              zoneName   <- safeGet
                              return (TimeZone mins summerOnly zoneName)
-    putCopy t = contain $ do safePut (timeZoneMinutes t)
-                             safePut (timeZoneSummerOnly t)
-                             safePut (timeZoneName t)
+    putCopy t = contain $    safePut (timeZoneMinutes t)
+                          <> safePut (timeZoneSummerOnly t)
+                          <> safePut (timeZoneName t)
     errorTypeName = typeName
 
 instance SafeCopy LocalTime where
@@ -340,8 +441,8 @@ instance SafeCopy LocalTime where
     getCopy   = contain $ do day <- safeGet
                              tod <- safeGet
                              return (LocalTime day tod)
-    putCopy t = contain $ do safePut (localDay t)
-                             safePut (localTimeOfDay t)
+    putCopy t = contain $    safePut (localDay t)
+                          <> safePut (localTimeOfDay t)
     errorTypeName = typeName
 
 instance SafeCopy ZonedTime where
@@ -349,8 +450,8 @@ instance SafeCopy ZonedTime where
     getCopy   = contain $ do localTime <- safeGet
                              timeZone  <- safeGet
                              return (ZonedTime localTime timeZone)
-    putCopy t = contain $ do safePut (zonedTimeToLocalTime t)
-                             safePut (zonedTimeZone t)
+    putCopy t = contain $    safePut (zonedTimeToLocalTime t)
+                          <> safePut (zonedTimeZone t)
     errorTypeName = typeName
 
 instance SafeCopy AbsoluteTime where
@@ -372,61 +473,61 @@ instance SafeCopy ClockTime where
                            pico <- safeGet
                            return (TOD secs pico)
     putCopy (TOD secs pico) =
-              contain $ do safePut secs
-                           safePut pico
+              contain $    safePut secs
+                        <> safePut pico
 
 instance SafeCopy TimeDiff where
     kind = base
-    getCopy   = contain $ do year    <- get
-                             month   <- get
-                             day     <- get
-                             hour    <- get
-                             mins    <- get
-                             sec     <- get
-                             pico    <- get
+    getCopy   = contain $ do year    <- decode
+                             month   <- decode
+                             day     <- decode
+                             hour    <- decode
+                             mins    <- decode
+                             sec     <- decode
+                             pico    <- decode
                              return (TimeDiff year month day hour mins sec pico)
-    putCopy t = contain $ do put (tdYear t)
-                             put (tdMonth t)
-                             put (tdDay t)
-                             put (tdHour t)
-                             put (tdMin t)
-                             put (tdSec t)
-                             put (tdPicosec t)
+    putCopy t = contain $    encode (tdYear t)
+                          <> encode (tdMonth t)
+                          <> encode (tdDay t)
+                          <> encode (tdHour t)
+                          <> encode (tdMin t)
+                          <> encode (tdSec t)
+                          <> encode (tdPicosec t)
 
 instance SafeCopy OT.Day where
-    kind = base ; getCopy = contain $ toEnum <$> get ; putCopy = contain . put . fromEnum
+    kind = base ; getCopy = contain $ toEnum <$> decode ; putCopy = contain . encode . fromEnum
 
 instance SafeCopy Month where
-    kind = base ; getCopy = contain $ toEnum <$> get ; putCopy = contain . put . fromEnum
+    kind = base ; getCopy = contain $ toEnum <$> decode ; putCopy = contain . encode . fromEnum
 
 
 instance SafeCopy CalendarTime where
     kind = base
-    getCopy   = contain $ do year   <- get
+    getCopy   = contain $ do year   <- decode
                              month  <- safeGet
-                             day    <- get
-                             hour   <- get
-                             mins   <- get
-                             sec    <- get
-                             pico   <- get
+                             day    <- decode
+                             hour   <- decode
+                             mins   <- decode
+                             sec    <- decode
+                             pico   <- decode
                              wday   <- safeGet
-                             yday   <- get
+                             yday   <- decode
                              tzname <- safeGet
-                             tz     <- get
-                             dst    <- get
+                             tz     <- decode
+                             dst    <- decode
                              return (CalendarTime year month day hour mins sec pico wday yday tzname tz dst)
-    putCopy t = contain $ do put     (ctYear t)
-                             safePut (ctMonth t)
-                             put     (ctDay t)
-                             put     (ctHour t)
-                             put     (ctMin t)
-                             put     (ctSec t)
-                             put     (ctPicosec t)
-                             safePut (ctWDay t)
-                             put     (ctYDay t)
-                             safePut (ctTZName t)
-                             put     (ctTZ t)
-                             put     (ctIsDST t)
+    putCopy t = contain $    encode  (ctYear t)
+                          <> safePut (ctMonth t)
+                          <> encode  (ctDay t)
+                          <> encode  (ctHour t)
+                          <> encode  (ctMin t)
+                          <> encode  (ctSec t)
+                          <> encode  (ctPicosec t)
+                          <> safePut (ctWDay t)
+                          <> encode  (ctYDay t)
+                          <> safePut (ctTZName t)
+                          <> encode  (ctTZ t)
+                          <> encode  (ctIsDST t)
 
 typeName :: Typeable a => Proxy a -> String
 typeName proxy = show (typeOf (undefined `asProxyType` proxy))
@@ -442,26 +543,85 @@ typeName2 :: (Typeable2 c) => Proxy (c a b) -> String
 typeName1 proxy = show (typeOf1 (undefined `asProxyType` proxy))
 typeName2 proxy = show (typeOf2 (undefined `asProxyType` proxy))
 
-getGenericVector :: (SafeCopy a, VG.Vector v a) => Contained (Get (v a))
-getGenericVector = contain $ do n <- get
-                                getSafeGet >>= VG.replicateM n
+encodeContainerSkel :: (Word -> Encoding)
+                    -> (container -> Int)
+                    -> (accumFunc -> Encoding -> container -> Encoding)
+                    -> accumFunc
+                    -> Encoding
+                    -> container
+                    -> Encoding
+encodeContainerSkel encodeLen size foldr' f v c =
+    v <> encodeLen (fromIntegral (size c)) <> foldr' f mempty c
+{-# INLINE encodeContainerSkel #-}
 
-putGenericVector :: (SafeCopy a, VG.Vector v a) => v a -> Contained Put
-putGenericVector v = contain $ do put (VG.length v)
-                                  getSafePut >>= VG.forM_ v
+decodeContainerSkelWithReplicate
+  :: (SafeCopy a)
+  => Decoder s Int
+     -- ^ How to get the size of the container
+  -> (Int -> Decoder s a -> Decoder s container)
+     -- ^ replicateM for the container
+  -> ([container] -> container)
+     -- ^ concat for the container
+  -> Decoder s container
+decodeContainerSkelWithReplicate decodeLen replicateFun fromList = do
+    -- Look at how much data we have at the moment and use it as the limit for
+    -- the size of a single call to replicateFun. We don't want to use
+    -- replicateFun directly on the result of decodeLen since this might lead to
+    -- DOS attack (attacker providing a huge value for length). So if it's above
+    -- our limit, we'll do manual chunking and then combine the containers into
+    -- one.
+    getter <- getSafeGet
+    size <- decodeLen
+    limit <- peekAvailable
+    if size <= limit
+       then replicateFun size getter
+       else do
+           -- Take the max of limit and a fixed chunk size (note: limit can be
+           -- 0). This basically means that the attacker can make us allocate a
+           -- container of size 128 even though there's no actual input.
+           let chunkSize = max limit 128
+               (d, m) = size `divMod` chunkSize
+               buildOne s = replicateFun s getter
+           containers <- sequence $ buildOne m : replicate d (buildOne chunkSize)
+           return $! fromList containers
+{-# INLINE decodeContainerSkelWithReplicate #-}
+
+getGenericVector :: (SafeCopy a, VG.Vector v a) => (Decoder s (v a))
+getGenericVector = 
+  decodeContainerSkelWithReplicate
+    decodeListLen
+    VG.replicateM
+    VG.concat
+{-# INLINE getGenericVector #-}
+
+putGenericVector :: (SafeCopy a, VG.Vector v a) => v a -> Encoding
+putGenericVector =
+  encodeContainerSkel
+    encodeListLen
+    VG.length
+    VG.foldr
+    (\a b -> putter a <> b)
+    versionHeader
+  where
+    (versionHeader, putter) = getSafePut
+{-# INLINE putGenericVector #-}
 
 instance SafeCopy a => SafeCopy (V.Vector a) where
-    getCopy = getGenericVector
-    putCopy = putGenericVector
+    kind = primitive
+    getCopy = contain getGenericVector
+    putCopy = contain . putGenericVector
 
 instance (SafeCopy a, VP.Prim a) => SafeCopy (VP.Vector a) where
-    getCopy = getGenericVector
-    putCopy = putGenericVector
+    kind = primitive
+    getCopy = contain getGenericVector
+    putCopy = contain . putGenericVector
 
 instance (SafeCopy a, VS.Storable a) => SafeCopy (VS.Vector a) where
-    getCopy = getGenericVector
-    putCopy = putGenericVector
+    kind = primitive
+    getCopy = contain getGenericVector
+    putCopy = contain . putGenericVector
 
 instance (SafeCopy a, VU.Unbox a) => SafeCopy (VU.Vector a) where
-    getCopy = getGenericVector
-    putCopy = putGenericVector
+    kind = primitive
+    getCopy = contain getGenericVector
+    putCopy = contain . putGenericVector

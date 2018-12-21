@@ -19,7 +19,8 @@ import Data.Data.Lens
 import Data.Fixed (Fixed, E1)
 import Data.List
 import Data.SafeCopy
-import Data.Serialize (runPut, runGet)
+import qualified Codec.CBOR.Write
+import qualified Codec.CBOR.Read
 import Data.Time (UniversalTime(..), ZonedTime(..))
 import Data.Tree (Tree)
 import Language.Haskell.TH
@@ -69,8 +70,8 @@ deriving instance Show UniversalTime
 
 -- | Equality on the 'Right' value, showing the unequal value on failure;
 -- or explicit failure using the 'Left' message without equality testing.
-(===) :: (Eq a, Show a) => Either String a -> a -> Property
-Left  e === _ = printTestCase e False
+(===) :: (Eq a, Show a) => Either Codec.CBOR.Read.DeserialiseFailure a -> a -> Property
+Left  e === _ = printTestCase (show e) False
 Right a === b = printTestCase (show a) $ a == b
 
 -- | An instance for 'SafeCopy' makes a type isomorphic to a bytestring
@@ -78,8 +79,8 @@ Right a === b = printTestCase (show a) $ a == b
 -- @decode@ is the inverse of @encode@ if we ignore bottom.
 prop_inverse :: (SafeCopy a, Arbitrary a, Eq a, Show a) => a -> Property
 prop_inverse a = (decode . encode) a === a where
-    encode = runPut . safePut
-    decode = runGet safeGet
+    encode = Codec.CBOR.Write.toLazyByteString . safePut
+    decode = fmap snd . Codec.CBOR.Read.deserialiseFromBytes safeGet 
 
 -- | Test the 'prop_inverse' property against all 'SafeCopy' instances
 -- (that also satisfy the rest of the constraints) defaulting any type
