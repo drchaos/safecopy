@@ -3,7 +3,7 @@
 -- http://www.haskell.org/cabal/release/cabal-latest/doc/users-guide/authors.html#pkg-descr.
 -- The name of the package.
 Name:                safecopy
-Version:             0.9.4.2
+Version:             0.10.0.0
 Synopsis:            Binary serialization with version control.
 Description:         An extension to Data.Serialize with built-in version control.
 Homepage:            https://github.com/acid-state/safecopy
@@ -32,7 +32,8 @@ Library
   -- Packages needed in order to build this package.
   Build-depends:       base >=4.5 && <5,
                        array < 0.6,
-                       cereal >= 0.5 && < 0.6,
+                       cborg, 
+                       serialise,
                        bytestring < 0.11,
                        containers >= 0.3 && < 0.7,
                        old-time < 1.2,
@@ -53,9 +54,6 @@ Library
 
   GHC-Options:         -Wall
 
-  if(impl(ghc >= 7.2.1))
-    cpp-options: -DDEFAULT_SIGNATURES
-
   if(impl(ghc >= 7.1))
     cpp-options: -DSAFE_HASKELL
 
@@ -66,4 +64,5 @@ Test-suite instances
   GHC-Options:         -Wall -threaded -rtsopts -with-rtsopts=-N
   Build-depends:       base, cereal, template-haskell, safecopy,
                        containers, time, array, vector, lens >= 4.7 && < 5.0,
+                       cborg,
                        lens-action, tasty, tasty-quickcheck, quickcheck-instances, QuickCheck

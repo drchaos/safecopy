@@ -7,7 +7,8 @@
 
 module Data.SafeCopy.Derive where
 
-import Data.Serialize (getWord8, putWord8, label)
+import Codec.Serialise.Decoding (decodeWord8, decodeListLen)
+import Codec.Serialise.Encoding (encodeWord8, encodeListLen)
 import Data.SafeCopy.SafeCopy
 
 #if MIN_VERSION_template_haskell(2,8,0)
@@ -23,6 +24,8 @@ import Data.Maybe (fromMaybe)
 #ifdef __HADDOCK__
 import Data.Word (Word8) -- Haddock
 #endif
+
+import Data.Monoid ((<>))
 
 -- | Derive an instance of 'SafeCopy'.
 --
@@ -222,10 +225,6 @@ deriveSafeCopyHappstackDataIndexedType = internalDeriveSafeCopyIndexedType Happs
 
 data DeriveType = Normal | Simple | HappstackData
 
-forceTag :: DeriveType -> Bool
-forceTag HappstackData = True
-forceTag _             = False
-
 tyVarName :: TyVarBndr -> Name
 tyVarName (PlainTV n) = n
 #if MIN_VERSION_template_haskell(2,10,0)
@@ -348,34 +347,33 @@ internalDeriveSafeCopyIndexedType' deriveType versionId kindName tyName tyIndex'
 mkPutCopy :: DeriveType -> [(Integer, Con)] -> DecQ
 mkPutCopy deriveType cons = funD 'putCopy $ map mkPutClause cons
     where
-      manyConstructors = length cons > 1 || forceTag deriveType
       mkPutClause (conNumber, con)
           = do putVars <- mapM (\n -> newName ("a" ++ show n)) [1..conSize con]
-               (putFunsDecs, putFuns) <- case deriveType of
-                                           Normal -> mkSafeFunctions "safePut_" 'getSafePut con
-                                           _      -> return ([], const 'safePut)
+               (_,putFuns) <- case deriveType of
+                                Normal -> mkSafeFunctions "safePut_" 'getSafePut con
+                                _      -> return ([], const 'safePut)
                let putClause   = conP (conName con) (map varP putVars)
-                   putCopyBody = varE 'contain `appE` doE (
-                                   [ noBindS $ varE 'putWord8 `appE` litE (IntegerL conNumber) | manyConstructors ] ++
-                                   putFunsDecs ++
-                                   [ noBindS $ varE (putFuns typ) `appE` varE var | (typ, var) <- zip (conTypes con) putVars ] ++
-                                   [ noBindS $ varE 'return `appE` tupE [] ])
+                   putCopyBody = varE 'contain `appE` (
+                                   foldl1 (\a t -> infixE (Just a) (varE '(<>)) (Just t)) $
+                                     [ varE 'encodeListLen `appE` litE (IntegerL (fromIntegral (conSize con + 1)))
+                                     , varE 'encodeWord8 `appE` litE (IntegerL conNumber) ] ++
+                                     [ varE (putFuns typ) `appE` varE var | (typ, var) <- zip (conTypes con) putVars ]
+                                 )
                clause [putClause] (normalB putCopyBody) []
 
 mkGetCopy :: DeriveType -> String -> [(Integer, Con)] -> DecQ
-mkGetCopy deriveType tyName cons = valD (varP 'getCopy) (normalB $ varE 'contain `appE` mkLabel) []
+mkGetCopy deriveType tyName cons = valD (varP 'getCopy) (normalB $ varE 'contain `appE` getCopyBody) []
     where
-      mkLabel = varE 'label `appE` litE (stringL labelString) `appE` getCopyBody
-      labelString = tyName ++ ":"
       getCopyBody
-          = case cons of
-              [(_, con)] | not (forceTag deriveType) -> mkGetBody con
-              _ -> do
-                tagVar <- newName "tag"
-                doE [ bindS (varP tagVar) (varE 'getWord8)
-                    , noBindS $ caseE (varE tagVar) (
-                        [ match (litP $ IntegerL i) (normalB $ mkGetBody con) [] | (i, con) <- cons ] ++
-                        [ match wildP (normalB $ varE 'fail `appE` errorMsg tagVar) [] ]) ]
+        = do
+            tagVar <- newName "tag"
+            conVar <- newName "con"
+            doE [ bindS (varP conVar) (varE 'decodeListLen)
+                , bindS (varP tagVar) (varE 'decodeWord8)
+                , noBindS $ caseE (tupE [varE tagVar, varE conVar]) (
+                    [ match (mkTupMatch i con) (normalB $ mkGetBody con) [] | (i, con) <- cons ] ++
+                    [ match wildP (normalB $ varE 'fail `appE` errorMsg tagVar) [] ]) ]
+      mkTupMatch i con = tupP [litP $ IntegerL i, litP $ IntegerL $ fromIntegral (conSize con + 1)]
       mkGetBody con
           = do (getFunsDecs, getFuns) <- case deriveType of
                                            Normal -> mkSafeFunctions "safeGet_" 'getSafeGet con
